@@ -134,8 +134,6 @@ if __name__ == '__main__':
         copoly_list = poly.random_copolymerize_rw_mp(mols, n, ratio=ratio, tacticity=data['input_tacticity'], ter1=ter, ter2=ter2,
                                                      nchain=data['input_nchain'], **rw_setting)
         for i in range(data['input_nchain']):
-            copoly_list[i] = poly.terminate_rw(copoly_list[i], ter, ter2)
-
             # Force field assignment
             result = ff.ff_assign(copoly_list[i])
             if not result:

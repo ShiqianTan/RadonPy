@@ -279,7 +279,10 @@ class TGMD_analyze(lammps.Analyze):
         df = self.read_log(self.log_file)
         df_mean = pd.DataFrame( [d[prop_list].mean() for d in df[0::2]] ).to_numpy().T
         df_index = df_mean[arg_get('Density')] <= 0.45
-        df_arg   = np.argsort(df_mean[arg_get('Temp'),df_index[0]])[0]
+        if df_index[0].any():
+            df_arg = np.argsort(df_mean[arg_get('Temp'),df_index[0]])[0]
+        else:
+            df_arg = 0
         df_mean = df_mean[:,df_arg:]
         ndim, ndata = df_mean.shape
         
@@ -363,80 +366,84 @@ class TGMD(EQMD):
     def exec(self, temp, confId=0, min_temp=50.0, time_step=1.0, interval_temp=10,
              cooling_rate=1e3, eq_step=0.5, omp=1, mpi=1, gpu=0, intel='auto', opt='auto', **kwargs):
         lmp = lammps.LAMMPS(work_dir=self.work_dir_tg, solver_path=self.solver_path)
-    
+
         #
         # Density check algorithms
         #
-        pre_cooling_rate = 2e2
-        t_start, t_stop=temp, 800
-        step = (t_stop-t_start)*pre_cooling_rate
-        lmp.make_dat(self.mol, file_name=self.pre_dat_file, confId=confId)
-        for i in range(10):
-            dt1 = datetime.datetime.now()
-            utils.radon_print('Density Search algorithm (tg_pre): No%02d (%d K -> %d K)'%(i+1, t_start, t_stop), level=1)
-            md1 = self.density_checker(t_start=t_start, t_stop=t_stop, step=(t_stop-t_start)*pre_cooling_rate)
-            lmp.make_input(md1, file_name=self.pre_in_file)
-            self.mol = lmp.run(md1, mol=self.mol, confId=confId, input_file=self.pre_in_file, omp=omp, mpi=mpi, gpu=gpu, intel=intel, opt=opt)
-            dt2 = datetime.datetime.now()
-            result = TGMD_analyze(log_file=os.path.join(self.work_dir_tg, self.pre_log_file), save_dir=self.save_dir).density_checker(i)
-            utils.radon_print('Complete Density Search algorithm (tg_pre: %0.2f). Elapsed time = %s' %(result['tg_init_density'], str(dt2-dt1)), level=1)
-            if result['tg_init_density_check']:
-                result['tg_max_temp'] = t_stop
-                break
-            else:
-                t_start = t_stop
-                t_stop  = result['tg_next_temp']        
-        utils.MolToJSON(self.mol, os.path.join(self.save_dir, self.pre_json_file))
-        utils.pickle_dump(self.mol, os.path.join(self.save_dir, self.pre_pickle_file))
-        self.data.update(result)
-        pd.DataFrame(self.data, index=[0]).to_csv(os.path.join(self.save_dir, self.csv_file))
-        
-        ####################
-        #self.mol = utils.pickle_load( os.path.join(self.save_dir, self.pre_pickle_file) )
-        #self.data = pd.read_csv(os.path.join(self.save_dir, self.csv_file)).iloc[0].to_dict()
-        ####################
-        
+        pre_pickle = os.path.join(self.save_dir, self.pre_pickle_file)
+        if os.path.isfile(pre_pickle):
+            utils.radon_print('Skip tg_pre: restoring from %s' % pre_pickle, level=1)
+            self.mol = utils.pickle_load(pre_pickle)
+            self.data = pd.read_csv(os.path.join(self.save_dir, self.csv_file), index_col=0).iloc[0].to_dict()
+        else:
+            pre_cooling_rate = 2e2
+            t_start, t_stop=temp, 800
+            step = (t_stop-t_start)*pre_cooling_rate
+            lmp.make_dat(self.mol, file_name=self.pre_dat_file, confId=confId)
+            for i in range(10):
+                dt1 = datetime.datetime.now()
+                utils.radon_print('Density Search algorithm (tg_pre): No%02d (%d K -> %d K)'%(i+1, t_start, t_stop), level=1)
+                md1 = self.density_checker(t_start=t_start, t_stop=t_stop, step=(t_stop-t_start)*pre_cooling_rate)
+                lmp.make_input(md1, file_name=self.pre_in_file)
+                self.mol = lmp.run(md1, mol=self.mol, confId=confId, input_file=self.pre_in_file, omp=omp, mpi=mpi, gpu=gpu, intel=intel, opt=opt)
+                dt2 = datetime.datetime.now()
+                result = TGMD_analyze(log_file=os.path.join(self.work_dir_tg, self.pre_log_file), save_dir=self.save_dir).density_checker(i)
+                utils.radon_print('Complete Density Search algorithm (tg_pre: %0.2f). Elapsed time = %s' %(result['tg_init_density'], str(dt2-dt1)), level=1)
+                if result['tg_init_density_check']:
+                    result['tg_max_temp'] = t_stop
+                    break
+                else:
+                    t_start = t_stop
+                    t_stop  = result['tg_next_temp']
+            utils.MolToJSON(self.mol, os.path.join(self.save_dir, self.pre_json_file))
+            utils.pickle_dump(self.mol, pre_pickle)
+            self.data.update(result)
+            pd.DataFrame(self.data, index=[0]).to_csv(os.path.join(self.save_dir, self.csv_file))
+
         #
         # Equilibration algorithm for Tg
         #
-        dt1 = datetime.datetime.now()
-        utils.radon_print('Equilibration (tg_eq) by LAMMPS is running...', level=1)
-        md2 = self.equilibration(temp=float(self.data['tg_max_temp']), step=5e5, **kwargs)
-        lmp.make_input(md2, file_name=self.eq_in_file)
-        self.mol = lmp.run(md2, mol=self.mol, confId=confId, input_file=self.eq_in_file,omp=omp, mpi=mpi, gpu=gpu, intel=intel, opt=opt)
-        dt2 = datetime.datetime.now()
-        utils.radon_print('Complete Equilibration (tg_eq). Elapsed time = %s' % str(dt2-dt1), level=1)
-        utils.MolToJSON(self.mol, os.path.join(self.save_dir, self.eq_json_file))
-        utils.pickle_dump(self.mol, os.path.join(self.save_dir, self.eq_pickle_file))
-        
-        ####################
-        #self.mol = utils.pickle_load( os.path.join(self.save_dir, self.eq_pickle_file) )
-        #self.data = pd.read_csv(os.path.join(self.save_dir, self.csv_file)).iloc[0].to_dict()
-        ####################
-        
-        
+        eq_pickle = os.path.join(self.save_dir, self.eq_pickle_file)
+        if os.path.isfile(eq_pickle):
+            utils.radon_print('Skip tg_eq: restoring from %s' % eq_pickle, level=1)
+            self.mol = utils.pickle_load(eq_pickle)
+        else:
+            dt1 = datetime.datetime.now()
+            utils.radon_print('Equilibration (tg_eq) by LAMMPS is running...', level=1)
+            md2 = self.equilibration(temp=float(self.data['tg_max_temp']), step=5e5, **kwargs)
+            lmp.make_input(md2, file_name=self.eq_in_file)
+            self.mol = lmp.run(md2, mol=self.mol, confId=confId, input_file=self.eq_in_file,omp=omp, mpi=mpi, gpu=gpu, intel=intel, opt=opt)
+            dt2 = datetime.datetime.now()
+            utils.radon_print('Complete Equilibration (tg_eq). Elapsed time = %s' % str(dt2-dt1), level=1)
+            utils.MolToJSON(self.mol, os.path.join(self.save_dir, self.eq_json_file))
+            utils.pickle_dump(self.mol, eq_pickle)
+
         #
         # Glass transition (Tg) algorithm
         #
         self.data['tg_min_temp'] = min_temp
         self.data['tg_cooling_rate'] = cooling_rate
         self.data['tg_interval_temp'] = interval_temp
-        t_step = (self.data['tg_max_temp'] - self.data['tg_min_temp'])/self.data['tg_interval_temp']*cooling_rate
-        dt1 = datetime.datetime.now()
-        utils.radon_print('Glass transition algorithm (tg) by LAMMPS is running...', level=1)
-        utils.radon_print('Total Computational Time: %d steps (= %0.2f ns)'%(t_step, t_step/1e6), level=1)
-        md3 = self.step_wise(max_temp=self.data['tg_max_temp'], 
-                             min_temp=self.data['tg_min_temp'], 
-                             cooling_rate=self.data['tg_cooling_rate'], 
-                             interval_temp=self.data['tg_interval_temp'], **kwargs)
-        lmp.make_input(md3, file_name=self.in_file)
-        self.mol = lmp.run(md3, mol=self.mol, confId=confId, input_file=self.in_file, omp=omp, mpi=mpi, gpu=gpu, intel=intel, opt=opt)
-        dt2 = datetime.datetime.now()
-        utils.radon_print('Complete glass transition algorithm (tg). Elapsed time = %s' % str(dt2-dt1), level=1)
-        
-        result = TGMD_analyze(log_file=os.path.join(self.work_dir_tg, self.log_file), save_dir=self.save_dir).step_wise()
+        tg_log = os.path.join(self.work_dir_tg, self.log_file)
+        if not os.path.isfile(tg_log):
+            t_step = (self.data['tg_max_temp'] - self.data['tg_min_temp'])/self.data['tg_interval_temp']*cooling_rate
+            dt1 = datetime.datetime.now()
+            utils.radon_print('Glass transition algorithm (tg) by LAMMPS is running...', level=1)
+            utils.radon_print('Total Computational Time: %d steps (= %0.2f ns)'%(t_step, t_step/1e6), level=1)
+            md3 = self.step_wise(max_temp=self.data['tg_max_temp'],
+                                 min_temp=self.data['tg_min_temp'],
+                                 cooling_rate=self.data['tg_cooling_rate'],
+                                 interval_temp=self.data['tg_interval_temp'], **kwargs)
+            lmp.make_input(md3, file_name=self.in_file)
+            self.mol = lmp.run(md3, mol=self.mol, confId=confId, input_file=self.in_file, omp=omp, mpi=mpi, gpu=gpu, intel=intel, opt=opt)
+            dt2 = datetime.datetime.now()
+            utils.radon_print('Complete glass transition algorithm (tg). Elapsed time = %s' % str(dt2-dt1), level=1)
+        else:
+            utils.radon_print('Skip tg MD: log already exists at %s' % tg_log, level=1)
+
+        result = TGMD_analyze(log_file=tg_log, save_dir=self.save_dir).step_wise()
         self.data.update(result)
-        
+
         return self.mol, self.data
 
         
